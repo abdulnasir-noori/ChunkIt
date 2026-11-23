@@ -35,7 +35,7 @@ To wipe the database: `docker compose down -v`.
 
 Progress is recomputed from sub-tasks whenever one changes. With no sub-tasks, progress and status are set manually.
 
-## Swarm deployment (Abdul)
+## Swarm deployment
 
 1. Create 2-3 Droplets with Docker; open ports 2377/tcp, 7946/tcp+udp, 4789/udp between them.
 2. Manager: `docker swarm init --advertise-addr <private-ip>`; workers run the printed `join` command.
