@@ -1,0 +1,49 @@
+# Swarm deploy (run on the manager, with the variables from .env exported):
+#   set -a; . ./.env; set +a
+#   docker stack deploy -c docker-stack.yml --with-registry-auth tracker
+version: "3.8"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - /mnt/pgdata/postgres:/var/lib/postgresql/data   # DigitalOcean Volume mounted at /mnt/pgdata
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.db == true   # docker node update --label-add db=true <node>
+
+  backend:
+    image: ${REGISTRY_USER}/tracker-backend:latest
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      JWT_SECRET: ${JWT_SECRET}
+    deploy:
+      replicas: 2
+      update_config:
+        order: start-first
+
+  notifier:
+    image: ${REGISTRY_USER}/tracker-backend:latest
+    command: ["node", "notifier.js"]
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      EMAIL_MODE: ${EMAIL_MODE}
+      RESEND_API_KEY: ${RESEND_API_KEY}
+      EMAIL_FROM: ${EMAIL_FROM}
+    deploy:
+      replicas: 1   # exactly one notifier, so reminders are not duplicated
+
+  frontend:
+    image: ${REGISTRY_USER}/tracker-frontend:latest
+    ports:
+      - "80:80"
+    deploy:
+      replicas: 2
+      update_config:
+        order: start-first
