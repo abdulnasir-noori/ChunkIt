@@ -122,11 +122,12 @@ async function ownsAssignment(id, userId) { // eslint-disable-line no-unused-var
   throw new Error('TO-DO: implement ownsAssignment()');
 }
 
-// TO-DO: courseOk(courseId, userId) -> boolean
-//   1. If courseId is empty/null, return true (assignment without a course is allowed).
-//   2. SELECT 1 FROM courses WHERE id = $1 AND user_id = $2; return rowCount > 0
-async function courseOk(courseId, userId) { // eslint-disable-line no-unused-vars
-  throw new Error('TO-DO: implement courseOk()');
+// courseOk(courseId, userId) -> true if no course was given, or the course belongs to this user.
+// Stops a user attaching an assignment to someone else's course.
+async function courseOk(courseId, userId) {
+  if (courseId === undefined || courseId === null || courseId === '') return true;
+  const { rowCount } = await pool.query('SELECT 1 FROM courses WHERE id = $1 AND user_id = $2', [courseId, userId]);
+  return rowCount > 0;
 }
 
 // ---------- Health (DONE) ----------
@@ -173,24 +174,42 @@ app.post('/api/auth/login', wrap(async (req, res) => {
 app.use('/api', auth);
 
 // ---------- Courses ----------
-// TO-DO: GET /api/courses -> course[]
-//   1. SELECT * FROM courses WHERE user_id = $1 ORDER BY name
-app.get('/api/courses', todo('list courses'));
+// GET /api/courses -> course[]  (only the logged-in user's courses)
+app.get('/api/courses', wrap(async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM courses WHERE user_id = $1 ORDER BY name', [req.user.id]);
+  res.json(rows);
+}));
 
-// TO-DO: POST /api/courses  body {name, code?, color?} -> 201 course
-//   1. 400 if name is missing.
-//   2. INSERT (user_id, name, code, color) with default color '#3b82f6' when none is given; RETURNING *
-app.post('/api/courses', todo('create course'));
+// POST /api/courses  body {name, code?, color?} -> 201 course
+app.post('/api/courses', wrap(async (req, res) => {
+  const { name, code, color } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'Course name is required' });
+  const { rows } = await pool.query(
+    'INSERT INTO courses (user_id, name, code, color) VALUES ($1, $2, $3, $4) RETURNING *',
+    [req.user.id, name, code || null, color || '#3b82f6']
+  );
+  res.status(201).json(rows[0]);
+}));
 
-// TO-DO: PUT /api/courses/:id  body any of {name, code, color} -> course
-//   1. UPDATE ... SET col = COALESCE($n, col) ... WHERE id = $4 AND user_id = $5 RETURNING *
-//   2. 404 if no row came back.
-app.put('/api/courses/:id', todo('update course'));
+// PUT /api/courses/:id  body any of {name, code, color} -> course
+// COALESCE($n, col) keeps the current value for any field that wasn't sent (undefined -> NULL).
+app.put('/api/courses/:id', wrap(async (req, res) => {
+  const { name, code, color } = req.body || {};
+  const { rows } = await pool.query(
+    `UPDATE courses SET name = COALESCE($1, name), code = COALESCE($2, code), color = COALESCE($3, color)
+      WHERE id = $4 AND user_id = $5 RETURNING *`,
+    [name, code, color, req.params.id, req.user.id]
+  );
+  if (!rows[0]) return res.status(404).json({ error: 'Course not found' });
+  res.json(rows[0]);
+}));
 
-// TO-DO: DELETE /api/courses/:id -> 204
-//   1. DELETE FROM courses WHERE id = $1 AND user_id = $2 (ON DELETE CASCADE removes its assignments)
-//   2. 404 if rowCount is 0.
-app.delete('/api/courses/:id', todo('delete course'));
+// DELETE /api/courses/:id -> 204  (ON DELETE CASCADE also removes the course's assignments)
+app.delete('/api/courses/:id', wrap(async (req, res) => {
+  const { rowCount } = await pool.query('DELETE FROM courses WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+  if (rowCount === 0) return res.status(404).json({ error: 'Course not found' });
+  res.status(204).end();
+}));
 
 // ---------- Assignments ----------
 // Shared query: assignment + course info + sub-task counts. Reuse it in the GET routes below.
@@ -203,44 +222,91 @@ const SELECT = `
 
 // NOTE: /upcoming and /overdue must be declared BEFORE /:id or "upcoming" is treated as an id.
 
-// TO-DO: GET /api/assignments/upcoming?days=14 -> assignment[]
-//   1. days = parseInt(req.query.days) || 14
-//   2. `${SELECT} AND a.status <> 'done' AND a.due_date >= now() AND a.due_date <= now() + ($2 || ' days')::interval ORDER BY a.due_date`
-//   3. params: [req.user.id, String(days)]
-app.get('/api/assignments/upcoming', todo('upcoming assignments'));
+// GET /api/assignments/upcoming?days=14 -> unfinished assignments due in the next N days (dashboard)
+app.get('/api/assignments/upcoming', wrap(async (req, res) => {
+  const days = parseInt(req.query.days, 10) || 14;
+  const { rows } = await pool.query(
+    `${SELECT} AND a.status <> 'done' AND a.due_date >= now()
+       AND a.due_date <= now() + $2::int * interval '1 day' ORDER BY a.due_date`,
+    [req.user.id, days]
+  );
+  res.json(rows);
+}));
 
-// TO-DO: GET /api/assignments/overdue -> assignment[]
-//   1. `${SELECT} AND a.status <> 'done' AND a.due_date < now() ORDER BY a.due_date`
-app.get('/api/assignments/overdue', todo('overdue assignments'));
+// GET /api/assignments/overdue -> unfinished assignments whose due date has passed (dashboard)
+app.get('/api/assignments/overdue', wrap(async (req, res) => {
+  const { rows } = await pool.query(
+    `${SELECT} AND a.status <> 'done' AND a.due_date < now() ORDER BY a.due_date`,
+    [req.user.id]
+  );
+  res.json(rows);
+}));
 
-// TO-DO: GET /api/assignments  optional ?course_id=&status=&from=&to= -> assignment[]
-//   1. Start from SELECT and params = [req.user.id].
-//   2. For each filter present, push the value to params and append e.g. ` AND a.course_id = $${params.length}`.
-//      (from/to filter a.due_date with >= and <=; the calendar uses them.)
-//   3. Append ' ORDER BY a.due_date'. Never build SQL by concatenating user values - always use $n params.
-app.get('/api/assignments', todo('list assignments'));
+// GET /api/assignments  optional ?course_id=&status=&from=&to= -> assignment[]
+// Builds the WHERE clause from whichever filters were sent. The VALUES always go in params as $n;
+// only fixed SQL text written here is ever added to the query string.
+app.get('/api/assignments', wrap(async (req, res) => {
+  const { course_id, status, from, to } = req.query;
+  let sql = SELECT;
+  const params = [req.user.id];
+  const add = (condition, value) => {
+    params.push(value);
+    sql += ` AND ${condition} $${params.length}`; // e.g. " AND a.course_id = $2"
+  };
+  if (course_id) add('a.course_id =', course_id);
+  if (status) add('a.status =', status);
+  if (from) add('a.due_date >=', from);
+  if (to) add('a.due_date <=', to);
+  const { rows } = await pool.query(sql + ' ORDER BY a.due_date', params);
+  res.json(rows);
+}));
 
-// TO-DO: GET /api/assignments/:id -> assignment + sub_assignments[]
-//   1. `${SELECT} AND a.id = $2`; 404 if missing.
-//   2. Also SELECT * FROM sub_assignments WHERE assignment_id = $1 ORDER BY id; return { ...row, sub_assignments }.
-app.get('/api/assignments/:id', todo('get assignment'));
+// GET /api/assignments/:id -> assignment (with course info + sub-task counts) + its sub_assignments[]
+app.get('/api/assignments/:id', wrap(async (req, res) => {
+  const { rows } = await pool.query(`${SELECT} AND a.id = $2`, [req.user.id, req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: 'Assignment not found' });
+  const subs = await pool.query('SELECT * FROM sub_assignments WHERE assignment_id = $1 ORDER BY id', [req.params.id]);
+  res.json({ ...rows[0], sub_assignments: subs.rows });
+}));
 
-// TO-DO: POST /api/assignments  body {title, due_date, course_id?, description?, priority?, status?, progress?} -> 201
-//   1. 400 if title or due_date missing.
-//   2. 400 'Invalid course' if !(await courseOk(course_id, req.user.id)).
-//   3. INSERT with COALESCE defaults: priority 'medium', status 'not_started', progress 0; RETURNING *
-//   4. Invalid enum/date values throw DB errors; the error handler below turns those into 400.
-app.post('/api/assignments', todo('create assignment'));
+// POST /api/assignments  body {title, due_date, course_id?, description?, priority?, status?, progress?} -> 201
+app.post('/api/assignments', wrap(async (req, res) => {
+  const { title, due_date, course_id, description, priority, status, progress } = req.body || {};
+  if (!title || !due_date) return res.status(400).json({ error: 'Title and due date are required' });
+  if (!(await courseOk(course_id, req.user.id))) return res.status(400).json({ error: 'Invalid course' });
+  // Missing priority/status/progress arrive as NULL; COALESCE swaps in the defaults.
+  // Bad values (priority 'urgent', progress 150, due_date 'soon') are rejected by the DB -> 400 via the error handler.
+  const { rows } = await pool.query(
+    `INSERT INTO assignments (user_id, course_id, title, description, due_date, priority, status, progress)
+     VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'medium'), COALESCE($7, 'not_started'), COALESCE($8, 0))
+     RETURNING *`,
+    [req.user.id, course_id || null, title, description || null, due_date, priority, status, progress]
+  );
+  res.status(201).json(rows[0]);
+}));
 
-// TO-DO: PUT /api/assignments/:id  body any of the fields above -> assignment
-//   1. If course_id is given, validate it with courseOk().
-//   2. UPDATE ... SET col = COALESCE($n, col) ... WHERE id = $8 AND user_id = $9 RETURNING *
-//   3. 404 if no row came back.
-app.put('/api/assignments/:id', todo('update assignment'));
+// PUT /api/assignments/:id  body any of the fields above -> assignment (partial update, like courses)
+app.put('/api/assignments/:id', wrap(async (req, res) => {
+  const { title, description, due_date, priority, status, progress, course_id } = req.body || {};
+  if (!(await courseOk(course_id, req.user.id))) return res.status(400).json({ error: 'Invalid course' });
+  const { rows } = await pool.query(
+    `UPDATE assignments SET
+       title = COALESCE($1, title), description = COALESCE($2, description), due_date = COALESCE($3, due_date),
+       priority = COALESCE($4, priority), status = COALESCE($5, status), progress = COALESCE($6, progress),
+       course_id = COALESCE($7, course_id)
+     WHERE id = $8 AND user_id = $9 RETURNING *`,
+    [title, description, due_date, priority, status, progress, course_id || null, req.params.id, req.user.id]
+  );
+  if (!rows[0]) return res.status(404).json({ error: 'Assignment not found' });
+  res.json(rows[0]);
+}));
 
-// TO-DO: DELETE /api/assignments/:id -> 204
-//   1. DELETE FROM assignments WHERE id = $1 AND user_id = $2 (sub-tasks cascade); 404 if rowCount is 0.
-app.delete('/api/assignments/:id', todo('delete assignment'));
+// DELETE /api/assignments/:id -> 204  (its sub-tasks and sent-notification records cascade)
+app.delete('/api/assignments/:id', wrap(async (req, res) => {
+  const { rowCount } = await pool.query('DELETE FROM assignments WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+  if (rowCount === 0) return res.status(404).json({ error: 'Assignment not found' });
+  res.status(204).end();
+}));
 
 // ---------- Sub-assignments ----------
 // TO-DO: ownership guard for everything under /api/assignments/:id/subs
@@ -271,7 +337,8 @@ app.delete('/api/assignments/:id/subs/:subId', todo('delete sub-assignment'));
 // ---------- Errors (DONE) ----------
 app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
   console.error(`[error] ${req.method} ${req.originalUrl}:`, err.message);
-  if (['23514', '22007', '22P02', '22003'].includes(err.code)) return res.status(400).json({ error: 'Invalid field value' });
+  // 23514 CHECK failed, 22007 bad date format, 22008 date out of range, 22P02 bad number, 22003 number too big
+  if (['23514', '22007', '22008', '22P02', '22003'].includes(err.code)) return res.status(400).json({ error: 'Invalid field value' });
   res.status(500).json({ error: 'Internal server error' });
 });
 
