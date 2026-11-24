@@ -86,19 +86,23 @@ const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).catch(nex
 // Placeholder response used by every unimplemented route.
 const todo = (what) => (req, res) => res.status(501).json({ error: `TO-DO: ${what}` });
 
-// TO-DO: sign(user) -> JWT string
-//   1. return jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' })
-function sign(user) { // eslint-disable-line no-unused-vars
-  throw new Error('TO-DO: implement sign()');
+// sign(user) -> JWT string containing the user's id and email, valid for 7 days.
+function sign(user) {
+  return jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
 }
 
-// TO-DO: auth middleware (protects every route registered after `app.use('/api', auth)`)
-//   1. Read the "Authorization: Bearer <token>" header and strip the "Bearer " prefix.
-//   2. jwt.verify(token, JWT_SECRET) inside try/catch.
-//   3. On success set req.user = { id, email } and call next().
-//   4. On failure respond 401 { error: 'Invalid or missing token' }.
-function auth(req, res, next) { // eslint-disable-line no-unused-vars
-  res.status(501).json({ error: 'TO-DO: implement auth middleware' });
+// Auth middleware: protects every route registered after `app.use('/api', auth)`.
+// Expects the header "Authorization: Bearer <token>".
+function auth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  try {
+    const payload = jwt.verify(token, JWT_SECRET); // throws if missing, tampered with, or expired
+    req.user = { id: payload.id, email: payload.email };
+  } catch {
+    return res.status(401).json({ error: 'Invalid or missing token' });
+  }
+  next(); // token is valid: continue to the route
 }
 
 // TO-DO: recalc(assignmentId) - recompute progress/status from sub-tasks
@@ -132,19 +136,38 @@ app.get('/api/health', wrap(async (req, res) => {
 }));
 
 // ---------- Auth ----------
-// TO-DO: POST /api/auth/register  body {email, password} -> 201 {token, user:{id,email}}
-//   1. Validate: email present, password present and >= 6 chars, else 400.
-//   2. Hash with bcrypt.hash(password, 10); lowercase + trim the email.
-//   3. INSERT INTO users (email, password_hash) VALUES ($1,$2) RETURNING id, email
-//   4. If err.code === '23505' (duplicate email) respond 409 { error: 'Email already registered' }.
-//   5. Respond 201 { token: sign(user), user }.
-app.post('/api/auth/register', todo('register'));
+// POST /api/auth/register  body {email, password} -> 201 {token, user:{id,email}}
+app.post('/api/auth/register', wrap(async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password || password.length < 6) {
+    return res.status(400).json({ error: 'Email and a password of at least 6 characters are required' });
+  }
+  const hash = await bcrypt.hash(password, 10); // 10 = cost factor (2^10 hashing rounds)
+  try {
+    const { rows } = await pool.query(
+      'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email',
+      [email.toLowerCase().trim(), hash]
+    );
+    const user = rows[0];
+    res.status(201).json({ token: sign(user), user });
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'Email already registered' });
+    throw err; // anything else goes to the error handler (500)
+  }
+}));
 
-// TO-DO: POST /api/auth/login  body {email, password} -> {token, user}
-//   1. SELECT * FROM users WHERE email = $1 (lowercased, trimmed).
-//   2. bcrypt.compare(password, user.password_hash); same 401 message for unknown email or wrong password.
-//   3. Respond { token: sign(user), user: { id, email } }.
-app.post('/api/auth/login', todo('login'));
+// POST /api/auth/login  body {email, password} -> {token, user}
+app.post('/api/auth/login', wrap(async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
+  const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email.toLowerCase().trim()]);
+  const user = rows[0];
+  // Same message whether the email is unknown or the password is wrong, so nobody can probe which emails exist.
+  if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+    return res.status(401).json({ error: 'Invalid email or password' });
+  }
+  res.json({ token: sign(user), user: { id: user.id, email: user.email } });
+}));
 
 // Everything below requires a logged-in user (needs auth() above) and is ALWAYS filtered by req.user.id.
 app.use('/api', auth);
