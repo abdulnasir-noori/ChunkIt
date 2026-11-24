@@ -1,7 +1,5 @@
-// Backend skeleton. DONE for you: DB schema + startup, health check, error handler, server boot.
-// TODO: every function/route marked "TO-DO" below. Until implemented, routes answer 501.
-// Suggested order: auth -> courses -> assignments -> sub-assignments + recalc -> /upcoming, /overdue.
-// Test each route with curl before using it from the frontend (see docs in README / docs/api list).
+// ChunkIt backend: REST API for users, courses, assignments and sub-tasks (Express + PostgreSQL).
+// Every route after `app.use('/api', auth)` requires a JWT and only touches the logged-in user's rows.
 const os = require('os');
 const express = require('express');
 const cors = require('cors');
@@ -81,10 +79,8 @@ app.use(cors()); // TODO (hardening, optional): restrict origins instead of allo
 app.use(express.json());
 
 // DONE: lets async route handlers throw; errors go to the error handler at the bottom.
-const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).catch(next);
-
-// Placeholder response used by every unimplemented route.
-const todo = (what) => (req, res) => res.status(501).json({ error: `TO-DO: ${what}` });
+// Passes `next` through too, so async middleware (the sub-task ownership guard) can use it.
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 // sign(user) -> JWT string containing the user's id and email, valid for 7 days.
 function sign(user) {
@@ -105,21 +101,26 @@ function auth(req, res, next) {
   next(); // token is valid: continue to the route
 }
 
-// TO-DO: recalc(assignmentId) - recompute progress/status from sub-tasks
-//   1. SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE is_done) AS done FROM sub_assignments WHERE assignment_id = $1
-//   2. If total is 0: return (manual progress/status stay as they are).
-//   3. progress = Math.round(100 * done / total)
-//   4. status = progress >= 100 ? 'done' : progress > 0 ? 'in_progress' : 'not_started'
-//   5. UPDATE assignments SET progress = $1, status = $2 WHERE id = $3
-async function recalc(assignmentId) { // eslint-disable-line no-unused-vars
-  throw new Error('TO-DO: implement recalc()');
+// recalc(assignmentId) - recompute an assignment's progress/status from its sub-tasks.
+// Called after every sub-task change. With no sub-tasks, manual progress/status are left alone.
+async function recalc(assignmentId) {
+  const { rows } = await pool.query(
+    `SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE is_done)::int AS done
+       FROM sub_assignments WHERE assignment_id = $1`,
+    [assignmentId]
+  );
+  const { total, done } = rows[0];
+  if (total === 0) return;
+  const progress = Math.round((100 * done) / total);
+  const status = progress >= 100 ? 'done' : progress > 0 ? 'in_progress' : 'not_started';
+  await pool.query('UPDATE assignments SET progress = $1, status = $2 WHERE id = $3', [progress, status, assignmentId]);
 }
 
-// TO-DO: ownsAssignment(id, userId) -> boolean
-//   1. SELECT 1 FROM assignments WHERE id = $1 AND user_id = $2
-//   2. return rowCount > 0   (used to stop users touching other people's sub-tasks)
-async function ownsAssignment(id, userId) { // eslint-disable-line no-unused-vars
-  throw new Error('TO-DO: implement ownsAssignment()');
+// ownsAssignment(id, userId) -> true if this assignment belongs to this user.
+// Sub-tasks have no user_id column, so ownership is checked through the parent assignment.
+async function ownsAssignment(id, userId) {
+  const { rowCount } = await pool.query('SELECT 1 FROM assignments WHERE id = $1 AND user_id = $2', [id, userId]);
+  return rowCount > 0;
 }
 
 // courseOk(courseId, userId) -> true if no course was given, or the course belongs to this user.
@@ -309,30 +310,57 @@ app.delete('/api/assignments/:id', wrap(async (req, res) => {
 }));
 
 // ---------- Sub-assignments ----------
-// TO-DO: ownership guard for everything under /api/assignments/:id/subs
-//   1. if (!(await ownsAssignment(req.params.id, req.user.id))) return 404 { error: 'Assignment not found' }
-//   2. otherwise next().  (Replace the 501 below with this logic.)
-app.use('/api/assignments/:id/subs', (req, res) => res.status(501).json({ error: 'TO-DO: sub-assignment ownership guard' }));
+// Ownership guard: runs before EVERY route under /api/assignments/:id/subs.
+// Checking once here means the four routes below can trust that :id belongs to the logged-in user.
+app.use('/api/assignments/:id/subs', wrap(async (req, res, next) => {
+  if (!(await ownsAssignment(req.params.id, req.user.id))) {
+    return res.status(404).json({ error: 'Assignment not found' });
+  }
+  next();
+}));
 
-// TO-DO: GET /api/assignments/:id/subs -> sub_assignment[]
-//   1. SELECT * FROM sub_assignments WHERE assignment_id = $1 ORDER BY id
-app.get('/api/assignments/:id/subs', todo('list sub-assignments'));
+// GET /api/assignments/:id/subs -> sub_assignment[]
+app.get('/api/assignments/:id/subs', wrap(async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM sub_assignments WHERE assignment_id = $1 ORDER BY id', [req.params.id]);
+  res.json(rows);
+}));
 
-// TO-DO: POST /api/assignments/:id/subs  body {title} -> 201 sub_assignment
-//   1. 400 if title missing; INSERT INTO sub_assignments (assignment_id, title) ... RETURNING *
-//   2. await recalc(req.params.id) so the parent progress updates.
-app.post('/api/assignments/:id/subs', todo('create sub-assignment'));
+// POST /api/assignments/:id/subs  body {title} -> 201 sub_assignment
+app.post('/api/assignments/:id/subs', wrap(async (req, res) => {
+  const { title } = req.body || {};
+  if (!title) return res.status(400).json({ error: 'Title is required' });
+  const { rows } = await pool.query(
+    'INSERT INTO sub_assignments (assignment_id, title) VALUES ($1, $2) RETURNING *',
+    [req.params.id, title]
+  );
+  await recalc(req.params.id); // a new unticked sub-task lowers the parent's progress
+  res.status(201).json(rows[0]);
+}));
 
-// TO-DO: PUT /api/assignments/:id/subs/:subId  body {title?, is_done?} -> sub_assignment
-//   1. UPDATE ... SET title = COALESCE($1, title), is_done = COALESCE($2, is_done)
-//      WHERE id = $3 AND assignment_id = $4 RETURNING *   (is_done must be a boolean; otherwise pass null)
-//   2. 404 if no row; then await recalc(req.params.id).
-app.put('/api/assignments/:id/subs/:subId', todo('update sub-assignment'));
+// PUT /api/assignments/:id/subs/:subId  body {title?, is_done?} -> sub_assignment
+app.put('/api/assignments/:id/subs/:subId', wrap(async (req, res) => {
+  const { title } = req.body || {};
+  const isDone = typeof req.body?.is_done === 'boolean' ? req.body.is_done : null; // ignore "yes", 1, etc.
+  const { rows } = await pool.query(
+    `UPDATE sub_assignments SET title = COALESCE($1, title), is_done = COALESCE($2, is_done)
+      WHERE id = $3 AND assignment_id = $4 RETURNING *`,
+    [title, isDone, req.params.subId, req.params.id]
+  );
+  if (!rows[0]) return res.status(404).json({ error: 'Sub-task not found' });
+  await recalc(req.params.id);
+  res.json(rows[0]);
+}));
 
-// TO-DO: DELETE /api/assignments/:id/subs/:subId -> 204
-//   1. DELETE FROM sub_assignments WHERE id = $1 AND assignment_id = $2; 404 if rowCount is 0.
-//   2. await recalc(req.params.id).
-app.delete('/api/assignments/:id/subs/:subId', todo('delete sub-assignment'));
+// DELETE /api/assignments/:id/subs/:subId -> 204
+app.delete('/api/assignments/:id/subs/:subId', wrap(async (req, res) => {
+  const { rowCount } = await pool.query(
+    'DELETE FROM sub_assignments WHERE id = $1 AND assignment_id = $2',
+    [req.params.subId, req.params.id]
+  );
+  if (rowCount === 0) return res.status(404).json({ error: 'Sub-task not found' });
+  await recalc(req.params.id);
+  res.status(204).end();
+}));
 
 // ---------- Errors (DONE) ----------
 app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
