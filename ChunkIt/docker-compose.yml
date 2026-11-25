@@ -24,7 +24,7 @@ services:
       db:
         condition: service_healthy
     ports:
-      - "4000:4000"
+      - "8000:4000"
 
   notifier:
     build: ./backend
